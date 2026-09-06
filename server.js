@@ -5,7 +5,22 @@ import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
-app.use(cors({origin:(process.env.FRONTEND_ORIGIN||'').split(',').filter(Boolean)}));
+const allowedOrigins = [
+  'https://kurinobol.netlify.app',
+  ...(process.env.FRONTEND_ORIGIN || '').split(',').map(x => x.trim()).filter(Boolean)
+];
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    console.error('CORS blocked origin:', origin);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json({limit:'2mb'}));
 
 const admin = createClient(
