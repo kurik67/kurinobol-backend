@@ -22,18 +22,81 @@ const TG = process.env.TELEGRAM_BOT_TOKEN
 async function currentUser(req){
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/,'');
   if(!token) return null;
-  const {data:{user}} = await admin.auth.getUser(token);
-  return user;
+
+  const {data:{user},error} = await admin.auth.getUser(token);
+  if(error || !user){
+    console.error('auth.getUser error:', error?.message || 'no user');
+    return null;
+  }
+  return { user, token };
 }
 
-async function isActivePro(userId){
+async function getProState(userId, accessToken){
+  const userClient = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY,
+    {
+      global:{headers:{Authorization:`Bearer ${accessToken}`}},
+      auth:{persistSession:false}
+    }
+  );
+
+  let {data,error} = await userClient
+    .from('profiles')
+    .select('id,pro_until')
+    .eq('id',userId)
+    .maybeSingle();
+
+  if(error || !data){
+    const fallback = await admin
+      .from('profiles')
+      .select('id,pro_until')
+      .eq('id',userId)
+      .maybeSingle();
+    data = fallback.data;
+    error = fallback.error;
+  }
+
+  if(error){
+    console.error('PRO profile lookup error:', error.message, 'user:', userId);
+    return {active:false, pro_until:null, reason:'profile_lookup_error'};
+  }
+  if(!data){
+    console.error('PRO profile missing for user:', userId);
+    return {active:false, pro_until:null, reason:'profile_missing'};
+  }
+
+  const until = data.pro_until ? new Date(data.pro_until) : null;
+  const active = !!until && !Number.isNaN(until.getTime()) && until.getTime() > Date.now();
+
+  console.log('PRO CHECK', {
+    user_id:userId,
+    pro_until:data.pro_until,
+    now:new Date().toISOString(),
+    active
+  });
+
+  return {
+    active,
+    pro_until:data.pro_until || null,
+    reason:active ? 'active' : 'expired_or_missing'
+  };
+}
+
+async function isActiveProServer(userId){
   const {data,error} = await admin
     .from('profiles')
     .select('pro_until')
-    .eq('id', userId)
-    .single();
-  if(error || !data?.pro_until) return false;
-  return new Date(data.pro_until) > new Date();
+    .eq('id',userId)
+    .maybeSingle();
+
+  if(error){
+    console.error('Server PRO lookup error:',error.message,'user:',userId);
+    return false;
+  }
+
+  const until = data?.pro_until ? new Date(data.pro_until) : null;
+  return !!until && !Number.isNaN(until.getTime()) && until.getTime() > Date.now();
 }
 
 async function tg(method, body){
@@ -94,11 +157,17 @@ app.get('/health',(req,res)=>res.json({
 // Backend verifies PRO and creates a one-time, 10-minute deep link to the bot.
 app.get('/api/pro/support',async(req,res)=>{
   try{
-    const user = await currentUser(req);
-    if(!user) return res.status(401).json({error:'Нужно войти'});
+    const authState = await currentUser(req);
+    if(!authState) return res.status(401).json({error:'Нужно войти'});
 
-    if(!(await isActivePro(user.id))){
-      return res.status(403).json({error:'Поддержка доступна только с активным PRO'});
+    const {user,token} = authState;
+    const proState = await getProState(user.id, token);
+
+    if(!proState.active){
+      return res.status(403).json({
+        error:'Поддержка доступна только с активным PRO',
+        code:proState.reason
+      });
     }
 
     const botUsername = (process.env.TELEGRAM_BOT_USERNAME || '').replace(/^@/,'');
@@ -201,7 +270,7 @@ async function processTelegramUpdate(update){
       return;
     }
 
-    if(!(await isActivePro(map.user_id))){
+    if(!(await isActiveProServer(map.user_id))){
       await tg('sendMessage',{
         chat_id:chatId,
         text:'У этого пользователя PRO уже закончился. Сообщение не отправлено.'
@@ -243,7 +312,7 @@ async function processTelegramUpdate(update){
       return;
     }
 
-    if(!(await isActivePro(ticket.user_id))){
+    if(!(await isActiveProServer(ticket.user_id))){
       await tg('sendMessage',{chat_id:chatId,text:'PRO уже не активен. Поддержка недоступна.'});
       return;
     }
@@ -281,7 +350,7 @@ async function processTelegramUpdate(update){
     return;
   }
 
-  if(!(await isActivePro(link.user_id))){
+  if(!(await isActiveProServer(link.user_id))){
     await tg('sendMessage',{
       chat_id:chatId,
       text:'Твой KURINOBOL PRO закончился. После продления поддержка снова откроется автоматически.'
@@ -343,8 +412,9 @@ PRO до: ${profile?.pro_until ? new Date(profile.pro_until).toLocaleDateString(
 
 app.post('/api/payments/create',async(req,res)=>{
   try{
-    const user=await currentUser(req);
-    if(!user) return res.status(401).json({error:'Нужно войти'});
+    const authState=await currentUser(req);
+    if(!authState) return res.status(401).json({error:'Нужно войти'});
+    const user=authState.user;
     if(req.body.plan!=='pro_month') return res.status(400).json({error:'Неизвестный тариф'});
 
     const idempotence=crypto.randomUUID();
