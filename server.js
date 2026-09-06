@@ -153,6 +153,52 @@ app.get('/health',(req,res)=>res.json({
   telegram:!!process.env.TELEGRAM_BOT_TOKEN
 }));
 
+// New account verification through Telegram. Email confirmation is disabled in Supabase.
+// Any signed-in account may request a short-lived one-time verification link.
+app.get('/api/account/telegram-link',async(req,res)=>{
+  try{
+    const authState=await currentUser(req);
+    if(!authState) return res.status(401).json({error:'Нужно войти'});
+    const user=authState.user;
+
+    const {data:profile,error:profileError}=await admin
+      .from('profiles')
+      .select('telegram_verified_at')
+      .eq('id',user.id)
+      .maybeSingle();
+
+    if(profileError) throw profileError;
+    if(!profile) return res.status(409).json({error:'Профиль аккаунта ещё не создан'});
+    if(profile.telegram_verified_at) return res.json({verified:true});
+
+    const botUsername=(process.env.TELEGRAM_BOT_USERNAME||'').replace(/^@/,'');
+    if(!botUsername || !process.env.TELEGRAM_BOT_TOKEN){
+      return res.status(503).json({error:'Telegram-бот пока не настроен'});
+    }
+
+    await admin.from('telegram_verify_tokens')
+      .delete()
+      .eq('user_id',user.id)
+      .is('used_at',null);
+
+    const raw=crypto.randomBytes(24).toString('base64url');
+    const hash=tokenHash(raw);
+    const expires=new Date(Date.now()+10*60*1000).toISOString();
+
+    const {error}=await admin.from('telegram_verify_tokens').insert({
+      user_id:user.id,
+      token_hash:hash,
+      expires_at:expires
+    });
+    if(error) throw error;
+
+    res.json({telegram_url:`https://t.me/${botUsername}?start=verify_${raw}`});
+  }catch(e){
+    console.error('Telegram account link error:',e);
+    res.status(500).json({error:'Не удалось создать ссылку подтверждения'});
+  }
+});
+
 // PRO user clicks "Написать в Telegram".
 // Backend verifies PRO and creates a one-time, 10-minute deep link to the bot.
 app.get('/api/pro/support',async(req,res)=>{
@@ -282,6 +328,94 @@ async function processTelegramUpdate(update){
       chat_id:map.user_chat_id,
       from_chat_id:chatId,
       message_id:m.message_id
+    });
+    return;
+  }
+
+  // New account confirmation link: /start verify_<token>.
+  // This path does NOT require PRO; it only proves control of a Telegram account.
+  if(text.startsWith('/start verify_')){
+    const startArg=text.split(/\s+/)[1]||'';
+    const raw=startArg.startsWith('verify_') ? startArg.slice('verify_'.length) : '';
+    if(!raw){
+      await tg('sendMessage',{chat_id:chatId,text:'Ссылка подтверждения повреждена. Получи новую на сайте KURINOBOL.'});
+      return;
+    }
+
+    const hash=tokenHash(raw);
+    const {data:ticket,error:ticketError}=await admin
+      .from('telegram_verify_tokens')
+      .select('id,user_id,expires_at,used_at')
+      .eq('token_hash',hash)
+      .maybeSingle();
+
+    if(ticketError){
+      console.error('Telegram verify token lookup:',ticketError);
+      await tg('sendMessage',{chat_id:chatId,text:'Не удалось проверить ссылку. Попробуй получить новую на сайте.'});
+      return;
+    }
+
+    if(!ticket || ticket.used_at || new Date(ticket.expires_at)<=new Date()){
+      await tg('sendMessage',{chat_id:chatId,text:'Эта ссылка уже использована или истекла. Вернись на сайт и получи новую.'});
+      return;
+    }
+
+    // One Telegram account cannot confirm two different KURINOBOL accounts.
+    const {data:otherLink,error:otherLinkError}=await admin
+      .from('telegram_links')
+      .select('user_id')
+      .eq('telegram_user_id',tgUserId)
+      .maybeSingle();
+
+    if(otherLinkError){
+      console.error('Telegram existing link lookup:',otherLinkError);
+      await tg('sendMessage',{chat_id:chatId,text:'Не удалось проверить Telegram-привязку. Попробуй ещё раз.'});
+      return;
+    }
+
+    if(otherLink && otherLink.user_id!==ticket.user_id){
+      await tg('sendMessage',{
+        chat_id:chatId,
+        text:'Этот Telegram уже привязан к другому аккаунту KURINOBOL. Для другого аккаунта нужен другой Telegram.'
+      });
+      return;
+    }
+
+    const now=new Date().toISOString();
+    const {error:linkError}=await admin.from('telegram_links').upsert({
+      user_id:ticket.user_id,
+      telegram_user_id:tgUserId,
+      chat_id:chatId,
+      telegram_username:username,
+      linked_at:now,
+      updated_at:now
+    },{onConflict:'user_id'});
+
+    if(linkError){
+      console.error('Telegram account link save:',linkError);
+      await tg('sendMessage',{chat_id:chatId,text:'Не удалось сохранить привязку Telegram. Попробуй ещё раз позже.'});
+      return;
+    }
+
+    const {error:profileError}=await admin.from('profiles')
+      .update({telegram_verified_at:now})
+      .eq('id',ticket.user_id);
+
+    if(profileError){
+      console.error('Telegram profile verify:',profileError);
+      await tg('sendMessage',{chat_id:chatId,text:'Telegram привязан, но аккаунт не удалось подтвердить. Попробуй ещё раз позже.'});
+      return;
+    }
+
+    await admin.from('telegram_verify_tokens')
+      .update({used_at:now})
+      .eq('id',ticket.id);
+
+    const frontend=(process.env.FRONTEND_URL||process.env.FRONTEND_ORIGIN||'https://kurinobol.netlify.app').split(',')[0].replace(/\/$/,'');
+    await tg('sendMessage',{
+      chat_id:chatId,
+      text:'Аккаунт KURINOBOL подтверждён ✅\nВернись на сайт — доступ уже открыт.',
+      reply_markup:{inline_keyboard:[[{text:'Вернуться на KURINOBOL →',url:`${frontend}/verify.html?verified=1`}]]}
     });
     return;
   }
