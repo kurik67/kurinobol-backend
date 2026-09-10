@@ -733,9 +733,43 @@ app.post('/api/yookassa/webhook',async(req,res)=>{
       .update({pro_until:base.toISOString()})
       .eq('id',userId);
 
+    // Remember the previous state so a retried YooKassa webhook does not spam the admin.
+    const {data:paymentRowBefore}=await admin
+      .from('payments')
+      .select('status')
+      .eq('yookassa_payment_id',paymentId)
+      .maybeSingle();
+
     await admin.from('payments')
       .update({status:'succeeded'})
       .eq('yookassa_payment_id',paymentId);
+
+    // Notify the KURINOBOL admin in Telegram that a receipt needs to be issued.
+    // Notification failure must never break payment activation/webhook acknowledgement.
+    if(paymentRowBefore?.status!=='succeeded'){
+      try{
+        const supportAdmin=await getAdmin();
+        if(supportAdmin?.chat_id){
+          let buyer='покупатель KURINOBOL';
+          try{
+            const {data:userData}=await admin.auth.admin.getUserById(userId);
+            if(userData?.user?.email) buyer=userData.user.email;
+          }catch(_){ }
+
+          await tg('sendMessage',{
+            chat_id:supportAdmin.chat_id,
+            text:`💰 Новая покупка KURINOBOL PRO — 149 ₽\n\nПокупатель: ${buyer}\n⚠️ Нужно сформировать и отправить чек.`,
+            reply_markup:{
+              inline_keyboard:[[
+                {text:'🧾 Открыть админку чеков',url:`${process.env.FRONTEND_URL}/admin.html`}
+              ]]
+            }
+          });
+        }
+      }catch(notifyError){
+        console.error('PAYMENT ADMIN TELEGRAM NOTIFY ERROR',notifyError?.message||notifyError);
+      }
+    }
 
     res.sendStatus(200);
   }catch(e){
