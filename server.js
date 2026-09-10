@@ -12,9 +12,7 @@ const allowedOrigins = [
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
     console.error('CORS blocked origin:', origin);
     return callback(new Error('Not allowed by CORS'));
   },
@@ -559,6 +557,58 @@ PRO до: ${profile?.pro_until ? new Date(profile.pro_until).toLocaleDateString(
   });
 }
 
+async function requireSiteAdmin(req,res){
+  const authState=await currentUser(req);
+  if(!authState){ res.status(401).json({error:'Нужно войти'}); return null; }
+  const {data,error}=await admin.from('site_admins').select('user_id').eq('user_id',authState.user.id).maybeSingle();
+  if(error){ console.error('site_admins lookup:',error.message); res.status(500).json({error:'Не удалось проверить доступ'}); return null; }
+  if(!data){ res.status(403).json({error:'Нет доступа'}); return null; }
+  return authState;
+}
+
+app.get('/api/admin/payments',async(req,res)=>{
+  try{
+    if(!await requireSiteAdmin(req,res)) return;
+    const {data,error}=await admin.from('payments')
+      .select('id,user_id,yookassa_payment_id,amount,status,created_at,receipt_status,receipt_url,receipt_sent_at')
+      .eq('status','succeeded').order('created_at',{ascending:false}).limit(200);
+    if(error) throw error;
+    const rows=[];
+    for(const p of data||[]){
+      const {data:u}=await admin.auth.admin.getUserById(p.user_id);
+      rows.push({...p,email:u?.user?.email||'—'});
+    }
+    res.json({payments:rows});
+  }catch(e){ console.error('admin payments:',e); res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/payments/:id/receipt',async(req,res)=>{
+  try{
+    if(!await requireSiteAdmin(req,res)) return;
+    const receiptUrl=String(req.body?.receipt_url||'').trim();
+    if(receiptUrl && !/^https:\/\//i.test(receiptUrl)) return res.status(400).json({error:'Ссылка на чек должна начинаться с https://'});
+    const {data:p,error}=await admin.from('payments').select('id,user_id,status').eq('id',req.params.id).single();
+    if(error||!p) return res.status(404).json({error:'Платёж не найден'});
+    if(p.status!=='succeeded') return res.status(400).json({error:'Платёж ещё не подтверждён'});
+
+    let sent=false;
+    if(receiptUrl){
+      const {data:link}=await admin.from('telegram_links').select('chat_id').eq('user_id',p.user_id).maybeSingle();
+      if(link?.chat_id && TG){
+        await tg('sendMessage',{
+          chat_id:link.chat_id,
+          text:`Чек за KURINOBOL PRO ✅\n${receiptUrl}\n\nСпасибо за покупку!`
+        });
+        sent=true;
+      }
+    }
+    const patch={receipt_status:'issued',receipt_url:receiptUrl||null,receipt_sent_at:sent?new Date().toISOString():null};
+    const {error:updateError}=await admin.from('payments').update(patch).eq('id',p.id);
+    if(updateError) throw updateError;
+    res.json({ok:true,sent});
+  }catch(e){ console.error('receipt mark:',e); res.status(500).json({error:e.message}); }
+});
+
 app.post('/api/payments/create',async(req,res)=>{
   try{
     const authState=await currentUser(req);
@@ -610,6 +660,7 @@ app.post('/api/payments/create',async(req,res)=>{
 app.post('/api/yookassa/webhook',async(req,res)=>{
   try{
     const event=req.body;
+    console.log('YOOKASSA WEBHOOK',event?.event,event?.object?.id||'');
     if(event.event!=='payment.succeeded') return res.sendStatus(200);
     const paymentId=event.object?.id;
     if(!paymentId) return res.sendStatus(200);
