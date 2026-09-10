@@ -566,9 +566,48 @@ async function requireSiteAdmin(req,res){
   return authState;
 }
 
+app.get('/api/admin/me',async(req,res)=>{
+  try{
+    const authState=await requireSiteAdmin(req,res);
+    if(!authState) return;
+    res.json({ok:true});
+  }catch(e){
+    console.error('admin me:',e);
+    res.status(500).json({error:'Не удалось проверить доступ'});
+  }
+});
+
+async function syncRecentYooKassaPayments(){
+  if(!process.env.YOOKASSA_SHOP_ID || !process.env.YOOKASSA_SECRET_KEY) return;
+  const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
+  const r=await fetch(`${YK}/payments?limit=100`,{headers:{'Authorization':`Basic ${auth}`}});
+  if(!r.ok){
+    const txt=await r.text().catch(()=> '');
+    console.error('YooKassa payments sync:',r.status,txt.slice(0,300));
+    return;
+  }
+  const payload=await r.json();
+  for(const p of payload.items||[]){
+    const userId=p.metadata?.user_id;
+    const validPlan=p.metadata?.plan==='pro_month';
+    const validAmount=p.amount?.value==='149.00' && p.amount?.currency==='RUB';
+    if(p.status!=='succeeded' || !userId || !validPlan || !validAmount) continue;
+    const {error}=await admin.from('payments').upsert({
+      user_id:userId,
+      yookassa_payment_id:p.id,
+      amount:149,
+      status:'succeeded',
+      created_at:p.created_at||new Date().toISOString()
+    },{onConflict:'yookassa_payment_id'});
+    if(error) console.error('payments sync upsert:',p.id,error.message);
+  }
+}
+
 app.get('/api/admin/payments',async(req,res)=>{
   try{
     if(!await requireSiteAdmin(req,res)) return;
+    // Восстанавливает и старые успешные платежи, даже если строка payments не сохранилась при оплате.
+    await syncRecentYooKassaPayments();
     const {data,error}=await admin.from('payments')
       .select('id,user_id,yookassa_payment_id,amount,status,created_at,receipt_status,receipt_url,receipt_sent_at')
       .eq('status','succeeded').order('created_at',{ascending:false}).limit(200);
