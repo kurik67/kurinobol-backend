@@ -577,29 +577,30 @@ app.get('/api/admin/me',async(req,res)=>{
   }
 });
 
+const PRODUCT_PLANS={
+  guide:{amount:99,name:'KURINOBOL GUIDE'},
+  tracker:{amount:199,name:'KURINOBOL TRACKER'},
+  pro:{amount:249,name:'KURINOBOL PRO'}
+};
+function planFromPayment(p){
+  const plan=p?.metadata?.plan;
+  if(plan==='pro_month' && p?.amount?.value==='149.00') return {key:'pro_month',amount:149,name:'KURINOBOL PRO (старый тариф)'};
+  const cfg=PRODUCT_PLANS[plan];
+  if(!cfg) return null;
+  if(p?.amount?.currency!=='RUB' || p?.amount?.value!==cfg.amount.toFixed(2)) return null;
+  return {key:plan,...cfg};
+}
 async function syncRecentYooKassaPayments(){
   if(!process.env.YOOKASSA_SHOP_ID || !process.env.YOOKASSA_SECRET_KEY) return;
   const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
   const r=await fetch(`${YK}/payments?limit=100`,{headers:{'Authorization':`Basic ${auth}`}});
-  if(!r.ok){
-    const txt=await r.text().catch(()=> '');
-    console.error('YooKassa payments sync:',r.status,txt.slice(0,300));
-    return;
-  }
+  if(!r.ok){const txt=await r.text().catch(()=> '');console.error('YooKassa payments sync:',r.status,txt.slice(0,300));return;}
   const payload=await r.json();
-  for(const p of payload.items||[]){
-    const userId=p.metadata?.user_id;
-    const validPlan=p.metadata?.plan==='pro_month';
-    const validAmount=p.amount?.value==='149.00' && p.amount?.currency==='RUB';
-    if(p.status!=='succeeded' || !userId || !validPlan || !validAmount) continue;
-    const {error}=await admin.from('payments').upsert({
-      user_id:userId,
-      yookassa_payment_id:p.id,
-      amount:149,
-      status:'succeeded',
-      created_at:p.created_at||new Date().toISOString()
-    },{onConflict:'yookassa_payment_id'});
-    if(error) console.error('payments sync upsert:',p.id,error.message);
+  for(const pay of payload.items||[]){
+    const userId=pay.metadata?.user_id, plan=planFromPayment(pay);
+    if(pay.status!=='succeeded'||!userId||!plan) continue;
+    const {error}=await admin.from('payments').upsert({user_id:userId,yookassa_payment_id:pay.id,amount:plan.amount,status:'succeeded',plan:plan.key,created_at:pay.created_at||new Date().toISOString()},{onConflict:'yookassa_payment_id'});
+    if(error) console.error('payments sync upsert:',pay.id,error.message);
   }
 }
 
@@ -609,7 +610,7 @@ app.get('/api/admin/payments',async(req,res)=>{
     // Восстанавливает и старые успешные платежи, даже если строка payments не сохранилась при оплате.
     await syncRecentYooKassaPayments();
     const {data,error}=await admin.from('payments')
-      .select('id,user_id,yookassa_payment_id,amount,status,created_at,receipt_status,receipt_url,receipt_sent_at')
+      .select('id,user_id,yookassa_payment_id,amount,status,plan,created_at,receipt_status,receipt_url,receipt_sent_at')
       .eq('status','succeeded').order('created_at',{ascending:false}).limit(200);
     if(error) throw error;
     const rows=[];
@@ -626,7 +627,7 @@ app.post('/api/admin/payments/:id/receipt',async(req,res)=>{
     if(!await requireSiteAdmin(req,res)) return;
     const receiptUrl=String(req.body?.receipt_url||'').trim();
     if(receiptUrl && !/^https:\/\//i.test(receiptUrl)) return res.status(400).json({error:'Ссылка на чек должна начинаться с https://'});
-    const {data:p,error}=await admin.from('payments').select('id,user_id,status').eq('id',req.params.id).single();
+    const {data:p,error}=await admin.from('payments').select('id,user_id,status,plan,amount').eq('id',req.params.id).single();
     if(error||!p) return res.status(404).json({error:'Платёж не найден'});
     if(p.status!=='succeeded') return res.status(400).json({error:'Платёж ещё не подтверждён'});
 
@@ -636,7 +637,7 @@ app.post('/api/admin/payments/:id/receipt',async(req,res)=>{
       if(link?.chat_id && TG){
         await tg('sendMessage',{
           chat_id:link.chat_id,
-          text:`Чек за KURINOBOL PRO ✅\n${receiptUrl}\n\nСпасибо за покупку!`
+          text:`Чек за ${PRODUCT_PLANS[p.plan]?.name||'KURINOBOL'} — ${p.amount} ₽ ✅\n${receiptUrl}\n\nСпасибо за покупку!`
         });
         sent=true;
       }
@@ -650,132 +651,40 @@ app.post('/api/admin/payments/:id/receipt',async(req,res)=>{
 
 app.post('/api/payments/create',async(req,res)=>{
   try{
-    const authState=await currentUser(req);
-    if(!authState) return res.status(401).json({error:'Нужно войти'});
-    const user=authState.user;
-    if(req.body.plan!=='pro_month') return res.status(400).json({error:'Неизвестный тариф'});
-
-    const idempotence=crypto.randomUUID();
+    const authState=await currentUser(req);if(!authState)return res.status(401).json({error:'Нужно войти'});
+    const user=authState.user, planKey=String(req.body?.plan||''), cfg=PRODUCT_PLANS[planKey];
+    if(!cfg)return res.status(400).json({error:'Неизвестный товар'});
+    const {data:profile}=await admin.from('profiles').select('guide_owned,tracker_owned,pro_owned').eq('id',user.id).single();
+    if(profile?.pro_owned || (planKey==='guide'&&profile?.guide_owned) || (planKey==='tracker'&&profile?.tracker_owned)) return res.status(400).json({error:'Этот доступ уже куплен'});
     const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
-    const response=await fetch(`${YK}/payments`,{
-      method:'POST',
-      headers:{
-        'Authorization':`Basic ${auth}`,
-        'Idempotence-Key':idempotence,
-        'Content-Type':'application/json'
-      },
-      body:JSON.stringify({
-        amount:{value:'149.00',currency:'RUB'},
-        capture:true,
-        confirmation:{
-          type:'redirect',
-          return_url:`${process.env.FRONTEND_URL}/payment-success.html`
-        },
-        description:'KURINOBOL PRO — 1 месяц',
-        metadata:{user_id:user.id,plan:'pro_month'}
-      })
-    });
-
-    const payment=await response.json();
-    if(!response.ok){
-      return res.status(response.status).json({
-        error:payment.description||'ЮKassa: ошибка создания платежа'
-      });
-    }
-
-    await admin.from('payments').insert({
-      user_id:user.id,
-      yookassa_payment_id:payment.id,
-      amount:149,
-      status:payment.status
-    });
-
+    const response=await fetch(`${YK}/payments`,{method:'POST',headers:{'Authorization':`Basic ${auth}`,'Idempotence-Key':crypto.randomUUID(),'Content-Type':'application/json'},body:JSON.stringify({amount:{value:cfg.amount.toFixed(2),currency:'RUB'},capture:true,confirmation:{type:'redirect',return_url:`${process.env.FRONTEND_URL}/payment-success.html?plan=${encodeURIComponent(planKey)}`},description:`${cfg.name} — разовый доступ`,metadata:{user_id:user.id,plan:planKey}})});
+    const payment=await response.json();if(!response.ok)return res.status(response.status).json({error:payment.description||'ЮKassa: ошибка создания платежа'});
+    const {error:ins}=await admin.from('payments').insert({user_id:user.id,yookassa_payment_id:payment.id,amount:cfg.amount,status:payment.status,plan:planKey});
+    if(ins)console.error('payment insert:',ins.message);
     res.json({confirmation_url:payment.confirmation?.confirmation_url});
-  }catch(e){
-    res.status(500).json({error:e.message});
-  }
+  }catch(e){res.status(500).json({error:e.message});}
 });
 
 app.post('/api/yookassa/webhook',async(req,res)=>{
   try{
-    const event=req.body;
-    console.log('YOOKASSA WEBHOOK',event?.event,event?.object?.id||'');
-    if(event.event!=='payment.succeeded') return res.sendStatus(200);
-    const paymentId=event.object?.id;
-    if(!paymentId) return res.sendStatus(200);
-
+    const event=req.body;console.log('YOOKASSA WEBHOOK',event?.event,event?.object?.id||'');if(event.event!=='payment.succeeded')return res.sendStatus(200);
+    const paymentId=event.object?.id;if(!paymentId)return res.sendStatus(200);
     const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
-    const verify=await fetch(`${YK}/payments/${paymentId}`,{
-      headers:{'Authorization':`Basic ${auth}`}
-    });
-    const payment=await verify.json();
-
-    if(!verify.ok || payment.status!=='succeeded') return res.sendStatus(400);
-
-    const userId=payment.metadata?.user_id;
-    const validPlan=payment.metadata?.plan==='pro_month';
-    const validAmount=payment.amount?.value==='149.00' && payment.amount?.currency==='RUB';
-    if(!userId || !validPlan || !validAmount) return res.sendStatus(400);
-
-    const {data:profile}=await admin
-      .from('profiles')
-      .select('pro_until')
-      .eq('id',userId)
-      .single();
-
-    const base=profile?.pro_until && new Date(profile.pro_until)>new Date()
-      ? new Date(profile.pro_until)
-      : new Date();
-
-    base.setDate(base.getDate()+30);
-
-    await admin.from('profiles')
-      .update({pro_until:base.toISOString()})
-      .eq('id',userId);
-
-    // Remember the previous state so a retried YooKassa webhook does not spam the admin.
-    const {data:paymentRowBefore}=await admin
-      .from('payments')
-      .select('status')
-      .eq('yookassa_payment_id',paymentId)
-      .maybeSingle();
-
-    await admin.from('payments')
-      .update({status:'succeeded'})
-      .eq('yookassa_payment_id',paymentId);
-
-    // Notify the KURINOBOL admin in Telegram that a receipt needs to be issued.
-    // Notification failure must never break payment activation/webhook acknowledgement.
-    if(paymentRowBefore?.status!=='succeeded'){
-      try{
-        const supportAdmin=await getAdmin();
-        if(supportAdmin?.chat_id){
-          let buyer='покупатель KURINOBOL';
-          try{
-            const {data:userData}=await admin.auth.admin.getUserById(userId);
-            if(userData?.user?.email) buyer=userData.user.email;
-          }catch(_){ }
-
-          await tg('sendMessage',{
-            chat_id:supportAdmin.chat_id,
-            text:`💰 Новая покупка KURINOBOL PRO — 149 ₽\n\nПокупатель: ${buyer}\n⚠️ Нужно сформировать и отправить чек.`,
-            reply_markup:{
-              inline_keyboard:[[
-                {text:'🧾 Открыть админку чеков',url:`${process.env.FRONTEND_URL}/admin.html`}
-              ]]
-            }
-          });
-        }
-      }catch(notifyError){
-        console.error('PAYMENT ADMIN TELEGRAM NOTIFY ERROR',notifyError?.message||notifyError);
-      }
+    const verify=await fetch(`${YK}/payments/${paymentId}`,{headers:{'Authorization':`Basic ${auth}`}});const payment=await verify.json();if(!verify.ok||payment.status!=='succeeded')return res.sendStatus(400);
+    const userId=payment.metadata?.user_id, plan=planFromPayment(payment);if(!userId||!plan)return res.sendStatus(400);
+    const {data:paymentRowBefore}=await admin.from('payments').select('status').eq('yookassa_payment_id',paymentId).maybeSingle();
+    if(plan.key==='pro_month'){
+      const {data:profile}=await admin.from('profiles').select('pro_until').eq('id',userId).single();const base=profile?.pro_until&&new Date(profile.pro_until)>new Date()?new Date(profile.pro_until):new Date();base.setDate(base.getDate()+30);await admin.from('profiles').update({pro_until:base.toISOString()}).eq('id',userId);
+    }else{
+      const patch=plan.key==='guide'?{guide_owned:true}:plan.key==='tracker'?{tracker_owned:true}:{guide_owned:true,tracker_owned:true,pro_owned:true};
+      const {error:pe}=await admin.from('profiles').update(patch).eq('id',userId);if(pe)throw pe;
     }
-
+    await admin.from('payments').upsert({user_id:userId,yookassa_payment_id:paymentId,amount:plan.amount,status:'succeeded',plan:plan.key,created_at:payment.created_at||new Date().toISOString()},{onConflict:'yookassa_payment_id'});
+    if(paymentRowBefore?.status!=='succeeded'){
+      try{const supportAdmin=await getAdmin();if(supportAdmin?.chat_id){let buyer='покупатель KURINOBOL';try{const {data:userData}=await admin.auth.admin.getUserById(userId);if(userData?.user?.email)buyer=userData.user.email}catch(_){}await tg('sendMessage',{chat_id:supportAdmin.chat_id,text:`💰 Новая покупка ${plan.name} — ${plan.amount} ₽\n\nПокупатель: ${buyer}\n⚠️ Нужно сформировать и отправить чек.`,reply_markup:{inline_keyboard:[[{text:'🧾 Открыть админку чеков',url:`${process.env.FRONTEND_URL}/admin.html`}]]}})}}catch(notifyError){console.error('PAYMENT ADMIN TELEGRAM NOTIFY ERROR',notifyError?.message||notifyError);}
+    }
     res.sendStatus(200);
-  }catch(e){
-    console.error(e);
-    res.sendStatus(500);
-  }
+  }catch(e){console.error(e);res.sendStatus(500);}
 });
 
 async function configureTelegramWebhook(){
