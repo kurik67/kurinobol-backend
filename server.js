@@ -56,14 +56,14 @@ async function getProState(userId, accessToken){
 
   let {data,error} = await userClient
     .from('profiles')
-    .select('id,pro_until')
+    .select('id,pro_until,pro_owned')
     .eq('id',userId)
     .maybeSingle();
 
   if(error || !data){
     const fallback = await admin
       .from('profiles')
-      .select('id,pro_until')
+      .select('id,pro_until,pro_owned')
       .eq('id',userId)
       .maybeSingle();
     data = fallback.data;
@@ -80,11 +80,12 @@ async function getProState(userId, accessToken){
   }
 
   const until = data.pro_until ? new Date(data.pro_until) : null;
-  const active = !!until && !Number.isNaN(until.getTime()) && until.getTime() > Date.now();
+  const active = !!data.pro_owned || (!!until && !Number.isNaN(until.getTime()) && until.getTime() > Date.now());
 
   console.log('PRO CHECK', {
     user_id:userId,
     pro_until:data.pro_until,
+    pro_owned:!!data.pro_owned,
     now:new Date().toISOString(),
     active
   });
