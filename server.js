@@ -580,8 +580,8 @@ app.get('/api/admin/me',async(req,res)=>{
 
 const PRODUCT_PLANS={
   guide:{amount:99,name:'KURINOBOL GUIDE'},
-  tracker:{amount:199,name:'KURINOBOL TRACKER'},
-  pro:{amount:249,name:'KURINOBOL PRO'}
+  tracker:{amount:149,name:'KURINOBOL TRACKER'},
+  pro:{amount:199,name:'KURINOBOL PRO'}
 };
 function planFromPayment(p){
   const plan=p?.metadata?.plan;
