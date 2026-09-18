@@ -156,7 +156,7 @@ async function sendUserStatus(chatId, userId){
 Последняя тренировка: ${last ? `${last.workout_no}/14` : 'ещё нет'}
 Последняя оценка: ${last?.feeling ?? '—'}
 
-Можешь написать вопрос по программе, тренировкам или технике. Фото и видео тоже можно отправлять — сообщение получит автор KURINOBOL.`
+Можешь написать вопрос по программе, тренировкам или технике. Фото и видео тоже можно отправлять — сообщение получит автор KURINOBOL.\n\nЛимит: до 5 сообщений в день. Каждое текстовое сообщение, фото или видео считается одним сообщением.`
   });
 }
 
@@ -280,6 +280,33 @@ app.post('/api/telegram/webhook',async(req,res)=>{
     if(!res.headersSent) res.sendStatus(500);
   }
 });
+
+
+const SUPPORT_DAILY_LIMIT = 5;
+
+function moscowDayBounds(){
+  // Daily support quota resets at 00:00 Moscow time (UTC+3).
+  const now = new Date();
+  const moscowNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const y = moscowNow.getUTCFullYear();
+  const m = moscowNow.getUTCMonth();
+  const d = moscowNow.getUTCDate();
+  const startUtc = new Date(Date.UTC(y, m, d, -3, 0, 0, 0));
+  const endUtc = new Date(Date.UTC(y, m, d + 1, -3, 0, 0, 0));
+  return {start:startUtc.toISOString(), end:endUtc.toISOString()};
+}
+
+async function supportMessagesToday(userId){
+  const {start,end}=moscowDayBounds();
+  const {count,error}=await admin
+    .from('support_messages')
+    .select('id',{count:'exact',head:true})
+    .eq('user_id',userId)
+    .gte('created_at',start)
+    .lt('created_at',end);
+  if(error) throw error;
+  return count || 0;
+}
 
 async function processTelegramUpdate(update){
   const m = update.message;
@@ -434,7 +461,7 @@ async function processTelegramUpdate(update){
     if(!raw){
       await tg('sendMessage',{
         chat_id:chatId,
-        text:'KURINOBOL BOT 🏋️\n\nЗдесь можно подтвердить аккаунт и написать автору по программе, тренировкам или технике.\n\nЧтобы привязать аккаунт, открой KURINOBOL → кабинет → «Написать автору в Telegram».'
+        text:'KURINOBOL BOT 🏋️\n\nЗдесь можно подтвердить аккаунт и написать автору по программе, тренировкам или технике.\n\nЧтобы привязать аккаунт, открой KURINOBOL → кабинет → «Написать автору в Telegram».\n\nЛимит общения с автором: 5 сообщений в день. Фото и видео тоже считаются сообщениями.'
       });
       return;
     }
@@ -487,17 +514,34 @@ async function processTelegramUpdate(update){
     return;
   }
 
+  // /status is informational and does not consume the daily message quota.
+  if(text === '/status'){
+    await sendUserStatus(chatId,link.user_id);
+    return;
+  }
+
+  let usedToday=0;
+  try{
+    usedToday=await supportMessagesToday(link.user_id);
+  }catch(limitError){
+    console.error('Support daily limit check:',limitError?.message||limitError);
+    await tg('sendMessage',{chat_id:chatId,text:'Не удалось проверить дневной лимит сообщений. Попробуй чуть позже.'});
+    return;
+  }
+
+  if(usedToday >= SUPPORT_DAILY_LIMIT){
+    await tg('sendMessage',{
+      chat_id:chatId,
+      text:'Лимит на сегодня исчерпан: максимум 5 сообщений в день. Завтра снова будет доступно 5 сообщений.'
+    });
+    return;
+  }
+
   if(!supportAdmin){
     await tg('sendMessage',{
       chat_id:chatId,
       text:'Поддержка почти настроена, но автор ещё не привязал свой Telegram. Попробуй позже.'
     });
-    return;
-  }
-
-  // Commands that should not be forwarded.
-  if(text === '/status'){
-    await sendUserStatus(chatId,link.user_id);
     return;
   }
 
@@ -536,7 +580,7 @@ async function processTelegramUpdate(update){
 
   await tg('sendMessage',{
     chat_id:chatId,
-    text:'Передал автору KURINOBOL ✅\nОтвет придёт прямо сюда.'
+    text:`Передал автору KURINOBOL ✅\nОтвет придёт прямо сюда.\n\nСегодня осталось сообщений: ${Math.max(0,SUPPORT_DAILY_LIMIT-usedToday-1)} из ${SUPPORT_DAILY_LIMIT}.`
   });
 }
 
