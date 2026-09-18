@@ -141,24 +141,22 @@ async function getAdmin(){
 
 async function sendUserStatus(chatId, userId){
   const [{data:profile},{data:workouts}] = await Promise.all([
-    admin.from('profiles').select('one_rm,pro_until').eq('id',userId).single(),
+    admin.from('profiles').select('one_rm').eq('id',userId).single(),
     admin.from('workouts').select('workout_no,feeling,completed_at')
       .eq('user_id',userId).order('completed_at',{ascending:false}).limit(1)
   ]);
   const last = workouts?.[0];
-  const proText = profile?.pro_until
-    ? new Date(profile.pro_until).toLocaleDateString('ru-RU',{timeZone:'Europe/Moscow'})
-    : '—';
   await tg('sendMessage',{
     chat_id:chatId,
     text:
-`KURINOBOL PRO ✅
+`KURINOBOL BOT 🏋️
+Аккаунт подключён ✅
+
 1ПМ: ${profile?.one_rm ?? '—'} кг
 Последняя тренировка: ${last ? `${last.workout_no}/14` : 'ещё нет'}
 Последняя оценка: ${last?.feeling ?? '—'}
-PRO до: ${proText}
 
-Напиши вопрос одним сообщением или отправь фото/видео. Я передам его автору.`,
+Можешь написать вопрос по программе, тренировкам или технике. Фото и видео тоже можно отправлять — сообщение получит автор KURINOBOL.`
   });
 }
 
@@ -213,21 +211,25 @@ app.get('/api/account/telegram-link',async(req,res)=>{
   }
 });
 
-// PRO user clicks "Написать в Telegram".
-// Backend verifies PRO and creates a one-time, 10-minute deep link to the bot.
+// Registered user clicks "Написать автору в Telegram".
+// Creates a one-time, 10-minute deep link to the bot. No paid access is required.
 app.get('/api/pro/support',async(req,res)=>{
   try{
     const authState = await currentUser(req);
     if(!authState) return res.status(401).json({error:'Нужно войти'});
 
-    const {user,token} = authState;
-    const proState = await getProState(user.id, token);
+    const {user} = authState;
 
-    if(!proState.active){
-      return res.status(403).json({
-        error:'Поддержка доступна только с активным PRO',
-        code:proState.reason
-      });
+    const {data:profile,error:profileError} = await admin
+      .from('profiles')
+      .select('telegram_verified_at')
+      .eq('id',user.id)
+      .maybeSingle();
+
+    if(profileError) throw profileError;
+    if(!profile) return res.status(409).json({error:'Профиль аккаунта ещё не создан'});
+    if(!profile.telegram_verified_at){
+      return res.status(403).json({error:'Сначала подтверди аккаунт через Telegram'});
     }
 
     const botUsername = (process.env.TELEGRAM_BOT_USERNAME || '').replace(/^@/,'');
@@ -305,7 +307,7 @@ async function processTelegramUpdate(update){
 
     await tg('sendMessage',{
       chat_id:chatId,
-      text:'KURINOBOL Support подключён ✅\nТеперь сюда будут приходить сообщения активных PRO-пользователей. Отвечай через Reply на конкретное сообщение клиента.'
+      text:'KURINOBOL BOT подключён ✅\nСюда будут приходить вопросы пользователей KURINOBOL. Отвечай через Reply на конкретное сообщение — бот доставит ответ пользователю.'
     });
     return;
   }
@@ -326,14 +328,6 @@ async function processTelegramUpdate(update){
       await tg('sendMessage',{
         chat_id:chatId,
         text:'Не нашёл клиента для этого Reply. Отвечай именно на сообщение пользователя, которое прислал бот.'
-      });
-      return;
-    }
-
-    if(!(await isActiveProServer(map.user_id))){
-      await tg('sendMessage',{
-        chat_id:chatId,
-        text:'У этого пользователя PRO уже закончился. Сообщение не отправлено.'
       });
       return;
     }
@@ -440,7 +434,7 @@ async function processTelegramUpdate(update){
     if(!raw){
       await tg('sendMessage',{
         chat_id:chatId,
-        text:'Доступ к поддержке открывается из кабинета KURINOBOL PRO.\nЗайди на сайт → PRO-центр → «Написать в Telegram».'
+        text:'KURINOBOL BOT 🏋️\n\nЗдесь можно подтвердить аккаунт и написать автору по программе, тренировкам или технике.\n\nЧтобы привязать аккаунт, открой KURINOBOL → кабинет → «Написать автору в Telegram».'
       });
       return;
     }
@@ -460,12 +454,7 @@ async function processTelegramUpdate(update){
       return;
     }
 
-    if(!(await isActiveProServer(ticket.user_id))){
-      await tg('sendMessage',{chat_id:chatId,text:'PRO уже не активен. Поддержка недоступна.'});
-      return;
-    }
-
-    // Telegram account can be linked only after valid KURINOBOL PRO verification.
+    // Telegram account is linked only after a valid one-time KURINOBOL support link.
     await admin.from('telegram_links').upsert({
       user_id:ticket.user_id,
       telegram_user_id:tgUserId,
@@ -483,7 +472,7 @@ async function processTelegramUpdate(update){
     return;
   }
 
-  // Normal customer message: must be linked AND must still have active PRO.
+  // Normal customer message: account must be linked to KURINOBOL.
   const {data:link} = await admin
     .from('telegram_links')
     .select('user_id,chat_id')
@@ -493,15 +482,7 @@ async function processTelegramUpdate(update){
   if(!link){
     await tg('sendMessage',{
       chat_id:chatId,
-      text:'Сначала открой поддержку через свой KURINOBOL PRO-кабинет.'
-    });
-    return;
-  }
-
-  if(!(await isActiveProServer(link.user_id))){
-    await tg('sendMessage',{
-      chat_id:chatId,
-      text:'На этом аккаунте нет KURINOBOL PRO. Поддержка в Telegram доступна после покупки PRO.'
+      text:'Сначала привяжи аккаунт: открой KURINOBOL → кабинет → «Написать автору в Telegram».'
     });
     return;
   }
@@ -521,7 +502,7 @@ async function processTelegramUpdate(update){
   }
 
   const [{data:profile},{data:lastWorkouts}] = await Promise.all([
-    admin.from('profiles').select('one_rm,pro_until').eq('id',link.user_id).single(),
+    admin.from('profiles').select('one_rm').eq('id',link.user_id).single(),
     admin.from('workouts').select('workout_no,feeling,completed_at')
       .eq('user_id',link.user_id).order('completed_at',{ascending:false}).limit(1)
   ]);
@@ -530,11 +511,12 @@ async function processTelegramUpdate(update){
   const header = await tg('sendMessage',{
     chat_id:supportAdmin.chat_id,
     text:
-`KURINOBOL PRO ✅
+`💬 KURINOBOL · Новый вопрос
 1ПМ: ${profile?.one_rm ?? '—'} кг
 Тренировка: ${last ? `${last.workout_no}/14` : '—'}
 Последняя оценка: ${last?.feeling ?? '—'}
-PRO до: ${profile?.pro_until ? new Date(profile.pro_until).toLocaleDateString('ru-RU',{timeZone:'Europe/Moscow'}) : '—'}`
+
+Ответь через Reply на сообщение пользователя ниже.`
   });
 
   // copyMessage supports text, photo, video, voice, documents etc.
@@ -554,7 +536,7 @@ PRO до: ${profile?.pro_until ? new Date(profile.pro_until).toLocaleDateString(
 
   await tg('sendMessage',{
     chat_id:chatId,
-    text:'Отправлено автору ✅ Ответ придёт сюда.'
+    text:'Передал автору KURINOBOL ✅\nОтвет придёт прямо сюда.'
   });
 }
 
@@ -578,115 +560,7 @@ app.get('/api/admin/me',async(req,res)=>{
   }
 });
 
-const PRODUCT_PLANS={
-  guide:{amount:99,name:'KURINOBOL GUIDE'},
-  tracker:{amount:149,name:'KURINOBOL TRACKER'},
-  pro:{amount:199,name:'KURINOBOL PRO'}
-};
-function planFromPayment(p){
-  const plan=p?.metadata?.plan;
-  if(plan==='pro_month' && p?.amount?.value==='149.00') return {key:'pro_month',amount:149,name:'KURINOBOL PRO (старый тариф)'};
-  const cfg=PRODUCT_PLANS[plan];
-  if(!cfg) return null;
-  if(p?.amount?.currency!=='RUB' || p?.amount?.value!==cfg.amount.toFixed(2)) return null;
-  return {key:plan,...cfg};
-}
-async function syncRecentYooKassaPayments(){
-  if(!process.env.YOOKASSA_SHOP_ID || !process.env.YOOKASSA_SECRET_KEY) return;
-  const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
-  const r=await fetch(`${YK}/payments?limit=100`,{headers:{'Authorization':`Basic ${auth}`}});
-  if(!r.ok){const txt=await r.text().catch(()=> '');console.error('YooKassa payments sync:',r.status,txt.slice(0,300));return;}
-  const payload=await r.json();
-  for(const pay of payload.items||[]){
-    const userId=pay.metadata?.user_id, plan=planFromPayment(pay);
-    if(pay.status!=='succeeded'||!userId||!plan) continue;
-    const {error}=await admin.from('payments').upsert({user_id:userId,yookassa_payment_id:pay.id,amount:plan.amount,status:'succeeded',plan:plan.key,created_at:pay.created_at||new Date().toISOString()},{onConflict:'yookassa_payment_id'});
-    if(error) console.error('payments sync upsert:',pay.id,error.message);
-  }
-}
-
-app.get('/api/admin/payments',async(req,res)=>{
-  try{
-    if(!await requireSiteAdmin(req,res)) return;
-    // Восстанавливает и старые успешные платежи, даже если строка payments не сохранилась при оплате.
-    await syncRecentYooKassaPayments();
-    const {data,error}=await admin.from('payments')
-      .select('id,user_id,yookassa_payment_id,amount,status,plan,created_at,receipt_status,receipt_url,receipt_sent_at')
-      .eq('status','succeeded').order('created_at',{ascending:false}).limit(200);
-    if(error) throw error;
-    const rows=[];
-    for(const p of data||[]){
-      const {data:u}=await admin.auth.admin.getUserById(p.user_id);
-      rows.push({...p,email:u?.user?.email||'—'});
-    }
-    res.json({payments:rows});
-  }catch(e){ console.error('admin payments:',e); res.status(500).json({error:e.message}); }
-});
-
-app.post('/api/admin/payments/:id/receipt',async(req,res)=>{
-  try{
-    if(!await requireSiteAdmin(req,res)) return;
-    const receiptUrl=String(req.body?.receipt_url||'').trim();
-    if(receiptUrl && !/^https:\/\//i.test(receiptUrl)) return res.status(400).json({error:'Ссылка на чек должна начинаться с https://'});
-    const {data:p,error}=await admin.from('payments').select('id,user_id,status,plan,amount').eq('id',req.params.id).single();
-    if(error||!p) return res.status(404).json({error:'Платёж не найден'});
-    if(p.status!=='succeeded') return res.status(400).json({error:'Платёж ещё не подтверждён'});
-
-    let sent=false;
-    if(receiptUrl){
-      const {data:link}=await admin.from('telegram_links').select('chat_id').eq('user_id',p.user_id).maybeSingle();
-      if(link?.chat_id && TG){
-        await tg('sendMessage',{
-          chat_id:link.chat_id,
-          text:`Чек за ${PRODUCT_PLANS[p.plan]?.name||'KURINOBOL'} — ${p.amount} ₽ ✅\n${receiptUrl}\n\nСпасибо за покупку!`
-        });
-        sent=true;
-      }
-    }
-    const patch={receipt_status:'issued',receipt_url:receiptUrl||null,receipt_sent_at:sent?new Date().toISOString():null};
-    const {error:updateError}=await admin.from('payments').update(patch).eq('id',p.id);
-    if(updateError) throw updateError;
-    res.json({ok:true,sent});
-  }catch(e){ console.error('receipt mark:',e); res.status(500).json({error:e.message}); }
-});
-
-app.post('/api/payments/create',async(req,res)=>{
-  try{
-    const authState=await currentUser(req);if(!authState)return res.status(401).json({error:'Нужно войти'});
-    const user=authState.user, planKey=String(req.body?.plan||''), cfg=PRODUCT_PLANS[planKey];
-    if(!cfg)return res.status(400).json({error:'Неизвестный товар'});
-    const {data:profile}=await admin.from('profiles').select('guide_owned,tracker_owned,pro_owned').eq('id',user.id).single();
-    if(profile?.pro_owned || (planKey==='guide'&&profile?.guide_owned) || (planKey==='tracker'&&profile?.tracker_owned)) return res.status(400).json({error:'Этот доступ уже куплен'});
-    const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
-    const response=await fetch(`${YK}/payments`,{method:'POST',headers:{'Authorization':`Basic ${auth}`,'Idempotence-Key':crypto.randomUUID(),'Content-Type':'application/json'},body:JSON.stringify({amount:{value:cfg.amount.toFixed(2),currency:'RUB'},capture:true,confirmation:{type:'redirect',return_url:`${process.env.FRONTEND_URL}/payment-success.html?plan=${encodeURIComponent(planKey)}`},description:`${cfg.name} — разовый доступ`,metadata:{user_id:user.id,plan:planKey}})});
-    const payment=await response.json();if(!response.ok)return res.status(response.status).json({error:payment.description||'ЮKassa: ошибка создания платежа'});
-    const {error:ins}=await admin.from('payments').insert({user_id:user.id,yookassa_payment_id:payment.id,amount:cfg.amount,status:payment.status,plan:planKey});
-    if(ins)console.error('payment insert:',ins.message);
-    res.json({confirmation_url:payment.confirmation?.confirmation_url});
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
-app.post('/api/yookassa/webhook',async(req,res)=>{
-  try{
-    const event=req.body;console.log('YOOKASSA WEBHOOK',event?.event,event?.object?.id||'');if(event.event!=='payment.succeeded')return res.sendStatus(200);
-    const paymentId=event.object?.id;if(!paymentId)return res.sendStatus(200);
-    const auth=Buffer.from(`${process.env.YOOKASSA_SHOP_ID}:${process.env.YOOKASSA_SECRET_KEY}`).toString('base64');
-    const verify=await fetch(`${YK}/payments/${paymentId}`,{headers:{'Authorization':`Basic ${auth}`}});const payment=await verify.json();if(!verify.ok||payment.status!=='succeeded')return res.sendStatus(400);
-    const userId=payment.metadata?.user_id, plan=planFromPayment(payment);if(!userId||!plan)return res.sendStatus(400);
-    const {data:paymentRowBefore}=await admin.from('payments').select('status').eq('yookassa_payment_id',paymentId).maybeSingle();
-    if(plan.key==='pro_month'){
-      const {data:profile}=await admin.from('profiles').select('pro_until').eq('id',userId).single();const base=profile?.pro_until&&new Date(profile.pro_until)>new Date()?new Date(profile.pro_until):new Date();base.setDate(base.getDate()+30);await admin.from('profiles').update({pro_until:base.toISOString()}).eq('id',userId);
-    }else{
-      const patch=plan.key==='guide'?{guide_owned:true}:plan.key==='tracker'?{tracker_owned:true}:{guide_owned:true,tracker_owned:true,pro_owned:true};
-      const {error:pe}=await admin.from('profiles').update(patch).eq('id',userId);if(pe)throw pe;
-    }
-    await admin.from('payments').upsert({user_id:userId,yookassa_payment_id:paymentId,amount:plan.amount,status:'succeeded',plan:plan.key,created_at:payment.created_at||new Date().toISOString()},{onConflict:'yookassa_payment_id'});
-    if(paymentRowBefore?.status!=='succeeded'){
-      try{const supportAdmin=await getAdmin();if(supportAdmin?.chat_id){let buyer='покупатель KURINOBOL';try{const {data:userData}=await admin.auth.admin.getUserById(userId);if(userData?.user?.email)buyer=userData.user.email}catch(_){}await tg('sendMessage',{chat_id:supportAdmin.chat_id,text:`💰 Новая покупка ${plan.name} — ${plan.amount} ₽\n\nПокупатель: ${buyer}\n⚠️ Нужно сформировать и отправить чек.`,reply_markup:{inline_keyboard:[[{text:'🧾 Открыть админку чеков',url:`${process.env.FRONTEND_URL}/admin.html`}]]}})}}catch(notifyError){console.error('PAYMENT ADMIN TELEGRAM NOTIFY ERROR',notifyError?.message||notifyError);}
-    }
-    res.sendStatus(200);
-  }catch(e){console.error(e);res.sendStatus(500);}
-});
+// KURINOBOL FREE: платёжные маршруты удалены.
 
 async function configureTelegramWebhook(){
   const publicUrl=(process.env.PUBLIC_BACKEND_URL||'').replace(/\/$/,'');
