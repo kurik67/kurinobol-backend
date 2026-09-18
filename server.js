@@ -100,7 +100,7 @@ async function getProState(userId, accessToken){
 async function isActiveProServer(userId){
   const {data,error} = await admin
     .from('profiles')
-    .select('pro_until')
+    .select('pro_until,pro_owned')
     .eq('id',userId)
     .maybeSingle();
 
@@ -110,7 +110,7 @@ async function isActiveProServer(userId){
   }
 
   const until = data?.pro_until ? new Date(data.pro_until) : null;
-  return !!until && !Number.isNaN(until.getTime()) && until.getTime() > Date.now();
+  return !!data?.pro_owned || (!!until && !Number.isNaN(until.getTime()) && until.getTime() > Date.now());
 }
 
 async function tg(method, body){
@@ -501,7 +501,7 @@ async function processTelegramUpdate(update){
   if(!(await isActiveProServer(link.user_id))){
     await tg('sendMessage',{
       chat_id:chatId,
-      text:'Твой KURINOBOL PRO закончился. После продления поддержка снова откроется автоматически.'
+      text:'На этом аккаунте нет KURINOBOL PRO. Поддержка в Telegram доступна после покупки PRO.'
     });
     return;
   }
